@@ -10,6 +10,20 @@
 # minutes/storage there); only private-repo usage is compared against quota.
 set -euo pipefail
 
+EXTENDED=0
+for arg in "$@"; do
+  case "$arg" in
+    -x|--extended) EXTENDED=1 ;;
+    -h|--help)
+      echo "usage: gh ab [-x|--extended]"
+      echo "  (default)    compact one-line-per-bucket budget report"
+      echo "  -x/--extended  also print the per-bucket used/projected bars and the"
+      echo "                 full day-by-day quota trace with tick marks"
+      exit 0
+      ;;
+  esac
+done
+
 # --- color setup (uses the full 256-color palette when the terminal has it) ---
 NCOLORS=0
 [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && NCOLORS=$(tput colors 2>/dev/null || echo 0)
@@ -204,4 +218,112 @@ jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson daysInMonth "$DAYS_IN_MONTH
     note="${ALERT}crosses quota ~${xdate}${RESET}"
   fi
   printf '%-16s  %s  %s\n' "$bucket" "$line" "$note"
+done
+
+[ "$EXTENDED" = 1 ] || exit 0
+
+# ============================================================================
+# --extended: the fuller, one-bucket-per-block breakdown
+# ============================================================================
+echo
+echo "${TITLE}── extended ──────────────────────────────────────────────${RESET}"
+
+BAR_WIDTH1=40   # scale: 0%..200%, so 100% (quota line) sits at column BAR_WIDTH1/2
+QUOTA_COL=$((BAR_WIDTH1 / 2))
+
+bar1() {
+  # $1 = pct (may exceed 200), fills proportionally on a 0-200% scale
+  local pct=$1 filled color i out=""
+  filled=$(awk -v p="$pct" -v w="$BAR_WIDTH1" 'BEGIN{c=p/200*w; if(c>w)c=w; if(c<0)c=0; printf "%d", c+0.5}')
+  color=$(band "$pct")
+  out="${color}"
+  for ((i = 0; i < filled; i++)); do out+="█"; done
+  out+="${RESET}${DIM}"
+  for ((i = filled; i < BAR_WIDTH1; i++)); do out+="·"; done
+  out+="${RESET}"
+  printf '%s' "$out"
+}
+
+echo
+echo "${TITLE}Budget${RESET} ${MUTED}(private-repo usage only; scale 0% ────────── 100%=quota ────────── 200%)${RESET}"
+printf '%*s%s%s%s\n' $((QUOTA_COL + 12)) "" "$MUTED" "↑ quota" "$RESET"
+
+jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson day "$DAY" --argjson daysInMonth "$DAYS_IN_MONTH" "
+  $JQ_COMMON
+  [.usageItems[] | . + {bucket: bucket, private: ([.repositoryName] | inside(\$priv))}]
+  | group_by(.bucket)
+  | map({bucket: .[0].bucket, gross_private: (map(select(.private) | .grossAmount) | add // 0)})
+  | map(. + {quota: (.bucket | quota)})
+  | map(select(.quota))
+  | map(. + {pct_used: (.gross_private / .quota * 100), projected: (.gross_private / \$day * \$daysInMonth)})
+  | map(. + {pct_projected: (.projected / .quota * 100)})
+  | .[]
+  | [.bucket, .gross_private, .quota, .pct_used, .projected, .pct_projected] | @tsv
+" <<<"$USAGE" | while IFS=$'\t' read -r bucket gross quota pct_used projected pct_projected; do
+  label=$(printf "%-16s \$%-6.2f / \$%-6.2f quota" "$bucket" "$gross" "$quota")
+  echo "${BOLD}${label}${RESET}"
+  printf '  used:      %s  %.1f%%\n' "$(bar1 "$pct_used")" "$pct_used"
+  over_note=""
+  awk -v p="$pct_projected" 'BEGIN{exit !(p>=100)}' && over_note="  ${ALERT}OVER BUDGET${RESET}"
+  printf '  projected: %s  %.1f%%%s\n\n' "$(bar1 "$pct_projected")" "$pct_projected" "$over_note"
+done
+
+echo "${TITLE}Day-by-day${RESET} ${MUTED}(day $DAY = today; ▓ = projected from today's average rate)${RESET}"
+echo
+
+jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson daysInMonth "$DAYS_IN_MONTH" "
+  $JQ_COMMON
+  [.usageItems[] | . + {bucket: bucket, private: ([.repositoryName] | inside(\$priv)), dnum: (.date[8:10] | tonumber)}]
+  | map(select(.private))
+  | group_by(.bucket)
+  | map({
+      bucket: .[0].bucket,
+      quota: (.[0].bucket | quota),
+      daysum: (group_by(.dnum) | map({(.[0].dnum | tostring): (map(.grossAmount) | add)}) | add // {}),
+    })
+  | map(select(.quota))
+  | map(.daysum as \$ds | . + {daily: [range(1; \$daysInMonth + 1) | (\$ds[(. | tostring)] // 0)]})
+  | .[]
+  | [.bucket, .quota, (.daily | @csv)] | @tsv
+" <<<"$USAGE" | while IFS=$'\t' read -r bucket quota daily_csv; do
+  IFS=',' read -r -a daily <<<"$daily_csv"
+
+  cum_today=0
+  for ((d = 1; d <= DAY; d++)); do cum_today=$(awk -v a="$cum_today" -v b="${daily[d-1]}" 'BEGIN{print a+b}'); done
+  avg=$(awk -v c="$cum_today" -v d="$DAY" 'BEGIN{print (d>0)? c/d : 0}')
+  final_pct=$(awk -v c="$cum_today" -v a="$avg" -v n="$DAYS_IN_MONTH" -v d="$DAY" -v q="$quota" 'BEGIN{print (c + a*(n-d)) / q * 100}')
+  awk -v p="$final_pct" 'BEGIN{exit !(p<60)}' && continue
+
+  label=$(printf "%-16s quota \$%.2f" "$bucket" "$quota")
+  echo "${BOLD}${label}${RESET}"
+
+  cum="0"; crossover=""; line=""
+  for ((d = 1; d <= DAYS_IN_MONTH; d++)); do
+    if ((d <= DAY)); then
+      cum=$(awk -v a="$cum" -v b="${daily[d-1]}" 'BEGIN{print a+b}')
+      ch="█"
+    else
+      cum=$(awk -v a="$cum" -v r="$avg" 'BEGIN{print a+r}')
+      ch="▓"
+    fi
+    pct=$(awk -v c="$cum" -v q="$quota" 'BEGIN{print c/q*100}')
+    [ -z "$crossover" ] && awk -v p="$pct" 'BEGIN{exit !(p>=100)}' && crossover=$d
+    line+="$(band "$pct")${ch}${RESET}"
+  done
+  echo "  $line"
+
+  ticks=""
+  for ((d = 1; d <= DAYS_IN_MONTH; d++)); do
+    if ((d == DAY)); then ticks+="^"; elif ((d % 5 == 0)); then ticks+="|"; else ticks+=" "; fi
+  done
+  echo "  ${MUTED}${ticks}${RESET}"
+  echo "  ${MUTED}day 1$(printf "%$((DAYS_IN_MONTH - 5))s" "day $DAYS_IN_MONTH")  (^ = today, day $DAY)${RESET}"
+
+  if [ -n "$crossover" ]; then
+    xdate=$(date -d "${YEAR}-$(printf '%02d' "$MONTH")-01 +$((crossover - 1)) days" +%Y-%m-%d)
+    echo "  ${ALERT}projected to cross the quota around day ${crossover} (${xdate})${RESET}"
+  else
+    echo "  ${MUTED}projected to stay under quota through day ${DAYS_IN_MONTH}${RESET}"
+  fi
+  echo
 done
