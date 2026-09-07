@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# gh-ab: Actions/Packages/LFS budget report for a personal GitHub account.
+#
+# GitHub's billing usage API (GET /users/{login}/settings/billing/usage) collapses
+# to one row per product+SKU per month when called with no year/month filter,
+# silently hiding all but one repo. Passing year+month explicitly returns one
+# row per repo+SKU+day instead, which is what this script relies on.
+#
+# Public repos never count against the Free-plan quota (unlimited free Actions
+# minutes/storage there); only private-repo usage is compared against quota.
+set -euo pipefail
+
+YEAR=$(date +%Y)
+MONTH=$(date +%-m)
+DAY=$(date +%-d)
+DAYS_IN_MONTH=$(date -d "${YEAR}-${MONTH}-01 +1 month -1 day" +%-d)
+LOGIN=$(gh api user --jq .login)
+
+USAGE=$(gh api "users/${LOGIN}/settings/billing/usage?year=${YEAR}&month=${MONTH}")
+
+REPOS=$(jq -r '[.usageItems[].repositoryName] | unique[]' <<<"$USAGE")
+
+PRIVATE_REPOS_JSON=$(
+  for r in $REPOS; do
+    vis=$(gh api "repos/${LOGIN}/${r}" --jq '.private' 2>/dev/null || echo "null")
+    [ "$vis" = "true" ] && printf '%s\n' "$r"
+  done | jq -R -s -c 'split("\n") | map(select(length > 0))'
+)
+
+echo "gh-ab :: ${LOGIN} :: billing cycle ${YEAR}-$(printf '%02d' "$MONTH")-01..${DAYS_IN_MONTH} (day ${DAY}/${DAYS_IN_MONTH})"
+echo
+
+jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson day "$DAY" --argjson daysInMonth "$DAYS_IN_MONTH" '
+  def is_minutes: test("Actions Linux|Actions Windows|Actions macOS");
+  def bucket:
+    if .sku|is_minutes then "Actions minutes"
+    elif .sku=="Actions storage" then "Actions storage"
+    elif .sku=="Git LFS bandwidth" then "Git LFS bandwidth"
+    elif .sku=="Git LFS storage" then "Git LFS storage"
+    elif .sku=="Packages data transfer" then "Packages transfer"
+    elif .sku=="Packages storage" then "Packages storage"
+    else "Other (" + .sku + ")"
+    end;
+  # Included-usage dollar values from the account billing page (github.com/settings/billing/usage).
+  # Not exposed by any API; re-check there if pricing/plan changes.
+  def quota:
+    if . == "Actions minutes" then 12.00
+    elif . == "Actions storage" then 0.125
+    elif . == "Git LFS bandwidth" then 0.875
+    elif . == "Git LFS storage" then 0.70
+    elif . == "Packages transfer" then 0.50
+    elif . == "Packages storage" then 0.125
+    else null
+    end;
+
+  [.usageItems[] | . + {bucket: bucket, private: ([.repositoryName] | inside($priv))}]
+  | group_by(.bucket)
+  | map({
+      bucket: .[0].bucket,
+      gross_private: (map(select(.private) | .grossAmount) | add // 0),
+      gross_public:  (map(select(.private|not) | .grossAmount) | add // 0),
+      net:           (map(.netAmount) | add // 0),
+    })
+  | map(. + {
+      quota: (.bucket | quota),
+      pct_used: (if (.bucket|quota) then (.gross_private / (.bucket|quota) * 100) else null end),
+      projected: (.gross_private / $day * $daysInMonth),
+    })
+  | map(. + {pct_projected: (if .quota then (.projected / .quota * 100) else null end)})
+  | (["BUCKET","PRIV.GROSS","PUB.GROSS(free)","QUOTA","%USED","PROJECTED","%PROJECTED","NET BILLED"] | @tsv),
+    (.[] | [
+      .bucket,
+      (.gross_private|tostring),
+      (.gross_public|tostring),
+      (.quota // "n/a" | tostring),
+      (.pct_used // "n/a" | if type=="number" then (.*10|round/10|tostring)+"%" else . end),
+      (.projected|tostring),
+      (.pct_projected // "n/a" | if type=="number" then (.*10|round/10|tostring)+"%" else . end),
+      (.net|tostring)
+    ] | @tsv)
+' <<<"$USAGE" | column -t -s $'\t'
+
+echo
+echo "PRIV.GROSS = usage from private repos (counts against quota)."
+echo "PUB.GROSS(free) = usage from public repos (always \$0 billed, doesn't touch quota)."
+echo "PROJECTED = PRIV.GROSS linearly extrapolated to end of billing cycle."
+
+# --- colored budget bars -----------------------------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; DIM=$'\033[2m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+  GREEN=""; YELLOW=""; RED=""; DIM=""; BOLD=""; RESET=""
+fi
+
+BAR_WIDTH=40   # scale: 0%..200%, so 100% (quota line) sits at column BAR_WIDTH/2
+QUOTA_COL=$((BAR_WIDTH / 2))
+
+bar() {
+  # $1 = pct (may exceed 200), fills proportionally on a 0-200% scale
+  local pct=$1 filled color i out=""
+  filled=$(awk -v p="$pct" -v w="$BAR_WIDTH" 'BEGIN{c=p/200*w; if(c>w)c=w; if(c<0)c=0; printf "%d", c+0.5}')
+  if awk -v p="$pct" 'BEGIN{exit !(p>=100)}'; then color=$RED
+  elif awk -v p="$pct" 'BEGIN{exit !(p>=60)}'; then color=$YELLOW
+  else color=$GREEN
+  fi
+  out="${color}"
+  for ((i = 0; i < filled; i++)); do out+="█"; done
+  out+="${RESET}${DIM}"
+  for ((i = filled; i < BAR_WIDTH; i++)); do out+="·"; done
+  out+="${RESET}"
+  printf '%s' "$out"
+}
+
+echo
+echo "${BOLD}Budget (private-repo usage only; scale 0% ────────── 100%=quota ────────── 200%)${RESET}"
+printf '%*s%s\n' $((QUOTA_COL + 12)) "" "↑ quota"
+
+jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson day "$DAY" --argjson daysInMonth "$DAYS_IN_MONTH" '
+  def is_minutes: test("Actions Linux|Actions Windows|Actions macOS");
+  def bucket:
+    if .sku|is_minutes then "Actions minutes"
+    elif .sku=="Actions storage" then "Actions storage"
+    elif .sku=="Git LFS bandwidth" then "Git LFS bandwidth"
+    elif .sku=="Git LFS storage" then "Git LFS storage"
+    elif .sku=="Packages data transfer" then "Packages transfer"
+    elif .sku=="Packages storage" then "Packages storage"
+    else "Other (" + .sku + ")"
+    end;
+  def quota:
+    if . == "Actions minutes" then 12.00
+    elif . == "Actions storage" then 0.125
+    elif . == "Git LFS bandwidth" then 0.875
+    elif . == "Git LFS storage" then 0.70
+    elif . == "Packages transfer" then 0.50
+    elif . == "Packages storage" then 0.125
+    else null
+    end;
+
+  [.usageItems[] | . + {bucket: bucket, private: ([.repositoryName] | inside($priv))}]
+  | group_by(.bucket)
+  | map({bucket: .[0].bucket, gross_private: (map(select(.private) | .grossAmount) | add // 0)})
+  | map(. + {quota: (.bucket | quota)})
+  | map(select(.quota))
+  | map(. + {
+      pct_used: (.gross_private / .quota * 100),
+      projected: (.gross_private / $day * $daysInMonth),
+    })
+  | map(. + {pct_projected: (.projected / .quota * 100)})
+  | .[]
+  | [.bucket, .gross_private, .quota, .pct_used, .projected, .pct_projected] | @tsv
+' <<<"$USAGE" | while IFS=$'\t' read -r bucket gross quota pct_used projected pct_projected; do
+  label=$(printf "%-16s \$%-6.2f / \$%-6.2f quota" "$bucket" "$gross" "$quota")
+  echo "$label"
+  printf '  used:      %s  %.1f%%\n' "$(bar "$pct_used")" "$pct_used"
+  over_note=""
+  awk -v p="$pct_projected" 'BEGIN{exit !(p>=100)}' && over_note="  ${RED}${BOLD}OVER BUDGET${RESET}"
+  printf '  projected: %s  %.1f%%%s\n\n' "$(bar "$pct_projected")" "$pct_projected" "$over_note"
+done
