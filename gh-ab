@@ -15,7 +15,7 @@ NCOLORS=0
 [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && NCOLORS=$(tput colors 2>/dev/null || echo 0)
 if [ "$NCOLORS" -ge 256 ]; then
   c() { printf '\033[%sm' "$1"; }          # c "38;5;N" / c "1;38;5;N"
-  BOLD=$(c 1); DIM=$(c 2); RESET=$(c 0)
+  BOLD=$(c 1); DIM=$(c 2); REV=$(c 7); RESET=$(c 0)
   HEADER=$(c "1;38;5;75")                  # bright azure
   TITLE=$(c "1;38;5;250")                  # light gray, bold
   MUTED=$(c "38;5;244")
@@ -31,7 +31,7 @@ if [ "$NCOLORS" -ge 256 ]; then
     fi
   }
 elif [ "$NCOLORS" -ge 8 ]; then
-  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; REV=$'\033[7m'; RESET=$'\033[0m'
   HEADER=$'\033[1;36m'; TITLE=$'\033[1;37m'; MUTED=$'\033[2m'; ALERT=$'\033[1;31m'
   band() {
     local pct=$1
@@ -41,7 +41,7 @@ elif [ "$NCOLORS" -ge 8 ]; then
     fi
   }
 else
-  BOLD=""; DIM=""; RESET=""; HEADER=""; TITLE=""; MUTED=""; ALERT=""
+  BOLD=""; DIM=""; REV=""; RESET=""; HEADER=""; TITLE=""; MUTED=""; ALERT=""
   band() { :; }
 fi
 
@@ -49,9 +49,10 @@ YEAR=$(date +%Y)
 MONTH=$(date +%-m)
 DAY=$(date +%-d)
 DAYS_IN_MONTH=$(date -d "${YEAR}-${MONTH}-01 +1 month -1 day" +%-d)
+MONTH_NAME=$(date -d "${YEAR}-${MONTH}-01" +%b)
 LOGIN=$(gh api user --jq .login)
 
-echo "${HEADER}gh-ab${RESET} :: ${BOLD}${LOGIN}${RESET} :: billing cycle ${YEAR}-$(printf '%02d' "$MONTH")-01..${DAYS_IN_MONTH} ${MUTED}(day ${DAY}/${DAYS_IN_MONTH})${RESET}" >&2
+echo "${HEADER}gh-ab${RESET} :: ${BOLD}${LOGIN}${RESET} :: ${MONTH_NAME} ${YEAR} ${MUTED}(day ${DAY}/${DAYS_IN_MONTH})${RESET}" >&2
 
 USAGE=$(gh api "users/${LOGIN}/settings/billing/usage?year=${YEAR}&month=${MONTH}")
 
@@ -61,7 +62,8 @@ N=$(wc -w <<<"$REPOS")
 # Visibility of each repo isn't in the usage report, so it takes one API call
 # per repo. Done serially that's N round-trips (~1.5s each => 30-40s for a
 # typical account) with nothing printed until it finishes. Run them in
-# parallel instead, with a live progress bar so it doesn't look hung.
+# parallel instead, with a live progress bar so it doesn't look hung; the bar
+# is cleared once done rather than left on screen.
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -72,16 +74,16 @@ printf '%s\n' $REPOS | xargs -P 8 -I{} bash -c '
 ' _ {} &
 XARGS_PID=$!
 
-WIDTH=30
+WIDTH=24
 while kill -0 "$XARGS_PID" 2>/dev/null; do
   done=$(find "$TMPDIR" -maxdepth 1 -name '*.vis' 2>/dev/null | wc -l)
   filled=$(( done * WIDTH / (N > 0 ? N : 1) ))
   bar=$(printf '%*s' "$filled" '' | tr ' ' '#')
-  printf '\r  checking repo visibility [%-*s] %d/%d' "$WIDTH" "$bar" "$done" "$N" >&2
+  printf '\r  checking %d repos [%-*s] %d/%d' "$N" "$WIDTH" "$bar" "$done" "$N" >&2
   sleep 0.15
 done
 wait "$XARGS_PID" 2>/dev/null || true
-printf '\r  checking repo visibility [%-*s] %d/%d\n' "$WIDTH" "$(printf '%*s' "$WIDTH" '' | tr ' ' '#')" "$N" "$N" >&2
+printf '\r\033[K' >&2   # clear the progress line instead of leaving it on screen
 
 PRIVATE_REPOS_JSON=$(
   for r in $REPOS; do
@@ -89,157 +91,77 @@ PRIVATE_REPOS_JSON=$(
     [ "$vis" = "true" ] && printf '%s\n' "$r"
   done | jq -R -s -c 'split("\n") | map(select(length > 0))'
 )
-echo >&2
-echo
 
-jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson day "$DAY" --argjson daysInMonth "$DAYS_IN_MONTH" '
-  def is_minutes: test("Actions Linux|Actions Windows|Actions macOS");
-  def bucket:
-    if .sku|is_minutes then "Actions minutes"
-    elif .sku=="Actions storage" then "Actions storage"
-    elif .sku=="Git LFS bandwidth" then "Git LFS bandwidth"
-    elif .sku=="Git LFS storage" then "Git LFS storage"
-    elif .sku=="Packages data transfer" then "Packages transfer"
-    elif .sku=="Packages storage" then "Packages storage"
-    else "Other (" + .sku + ")"
-    end;
-  # Included-usage dollar values from the account billing page (github.com/settings/billing/usage).
-  # Not exposed by any API; re-check there if pricing/plan changes.
-  def quota:
-    if . == "Actions minutes" then 12.00
-    elif . == "Actions storage" then 0.125
-    elif . == "Git LFS bandwidth" then 0.875
-    elif . == "Git LFS storage" then 0.70
-    elif . == "Packages transfer" then 0.50
-    elif . == "Packages storage" then 0.125
-    else null
-    end;
-  def money: (. * 100 | round) as $c | ($c / 100 | floor | tostring) + "." + (($c % 100) | tostring | if length == 1 then "0" + . else . end);
+# --- shared jq: usage rows -> one summary object per quota-bearing bucket ---
+read -r -d '' JQ_COMMON <<'EOF' || true
+def is_minutes: test("Actions Linux|Actions Windows|Actions macOS");
+def bucket:
+  if .sku|is_minutes then "Actions minutes"
+  elif .sku=="Actions storage" then "Actions storage"
+  elif .sku=="Git LFS bandwidth" then "Git LFS bandwidth"
+  elif .sku=="Git LFS storage" then "Git LFS storage"
+  elif .sku=="Packages data transfer" then "Packages transfer"
+  elif .sku=="Packages storage" then "Packages storage"
+  else "Other (" + .sku + ")"
+  end;
+# Included-usage dollar values from the account billing page (github.com/settings/billing/usage).
+# Not exposed by any API; re-check there if pricing/plan changes.
+def quota:
+  if . == "Actions minutes" then 12.00
+  elif . == "Actions storage" then 0.125
+  elif . == "Git LFS bandwidth" then 0.875
+  elif . == "Git LFS storage" then 0.70
+  elif . == "Packages transfer" then 0.50
+  elif . == "Packages storage" then 0.125
+  else null
+  end;
+def money: (. * 100 | round) as $c | ($c / 100 | floor | tostring) + "." + (($c % 100) | tostring | if length == 1 then "0" + . else . end);
+EOF
 
-  [.usageItems[] | . + {bucket: bucket, private: ([.repositoryName] | inside($priv))}]
-  | group_by(.bucket)
-  | map({
-      bucket: .[0].bucket,
-      gross_private: (map(select(.private) | .grossAmount) | add // 0),
-      gross_public:  (map(select(.private|not) | .grossAmount) | add // 0),
-      net:           (map(.netAmount) | add // 0),
-    })
-  | map(. + {
-      quota: (.bucket | quota),
-      pct_used: (if (.bucket|quota) then (.gross_private / (.bucket|quota) * 100) else null end),
-      projected: (.gross_private / $day * $daysInMonth),
-    })
-  | map(. + {pct_projected: (if .quota then (.projected / .quota * 100) else null end)})
-  | (["BUCKET","PRIV.GROSS","PUB.GROSS(free)","QUOTA","%USED","PROJECTED","%PROJECTED","NET BILLED"] | @tsv),
-    (.[] | [
-      .bucket,
-      ("$" + (.gross_private|money)),
-      ("$" + (.gross_public|money)),
-      (.quota // "n/a" | if type=="number" then "$" + money else . end),
-      (.pct_used // "n/a" | if type=="number" then (.*10|round/10|tostring)+"%" else . end),
-      ("$" + (.projected|money)),
-      (.pct_projected // "n/a" | if type=="number" then (.*10|round/10|tostring)+"%" else . end),
-      ("$" + (.net|money))
-    ] | @tsv)
-' <<<"$USAGE" | column -t -s $'\t'
-
-echo
-echo "${MUTED}PRIV.GROSS = usage from private repos (counts against quota).${RESET}"
-echo "${MUTED}PUB.GROSS(free) = usage from public repos (always \$0 billed, doesn't touch quota).${RESET}"
-echo "${MUTED}PROJECTED = PRIV.GROSS linearly extrapolated to end of billing cycle.${RESET}"
-
-# --- colored budget bars -----------------------------------------------
-BAR_WIDTH=40   # scale: 0%..200%, so 100% (quota line) sits at column BAR_WIDTH/2
-QUOTA_COL=$((BAR_WIDTH / 2))
-
+BAR_WIDTH=28   # scale 0%-200%; solid = used, medium shade = forecast gap, dot = untouched
 bar() {
-  # $1 = pct (may exceed 200), fills proportionally on a 0-200% scale, color
-  # picked from a 5-stop 256-color gradient (falls back to 3-stop on older terms)
-  local pct=$1 filled color i out=""
-  filled=$(awk -v p="$pct" -v w="$BAR_WIDTH" 'BEGIN{c=p/200*w; if(c>w)c=w; if(c<0)c=0; printf "%d", c+0.5}')
-  color=$(band "$pct")
-  out="${color}"
-  for ((i = 0; i < filled; i++)); do out+="█"; done
+  local used=$1 proj=$2 out="" i uf pf
+  uf=$(awk -v p="$used" -v w="$BAR_WIDTH" 'BEGIN{v=p/200*w; if(v>w)v=w; if(v<0)v=0; printf "%d", v+0.5}')
+  pf=$(awk -v p="$proj" -v w="$BAR_WIDTH" 'BEGIN{v=p/200*w; if(v>w)v=w; if(v<0)v=0; printf "%d", v+0.5}')
+  out="$(band "$used")"
+  for ((i = 0; i < uf; i++)); do out+="█"; done
+  out+="${RESET}$(band "$proj")"
+  for ((i = uf; i < pf; i++)); do out+="▓"; done
   out+="${RESET}${DIM}"
-  for ((i = filled; i < BAR_WIDTH; i++)); do out+="·"; done
+  for ((i = pf; i < BAR_WIDTH; i++)); do out+="·"; done
   out+="${RESET}"
   printf '%s' "$out"
 }
 
-echo
-echo "${TITLE}Budget${RESET} ${MUTED}(private-repo usage only; scale 0% ────────── 100%=quota ────────── 200%)${RESET}"
-printf '%*s%s%s%s\n' $((QUOTA_COL + 12)) "" "$MUTED" "↑ quota" "$RESET"
+echo "${TITLE}BUCKET            USED     QUOTA    ${MUTED}[0%${DIM}···${MUTED}quota${DIM}···${MUTED}200%]${TITLE}                    USED%  PROJ%${RESET}"
 
-jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson day "$DAY" --argjson daysInMonth "$DAYS_IN_MONTH" '
-  def is_minutes: test("Actions Linux|Actions Windows|Actions macOS");
-  def bucket:
-    if .sku|is_minutes then "Actions minutes"
-    elif .sku=="Actions storage" then "Actions storage"
-    elif .sku=="Git LFS bandwidth" then "Git LFS bandwidth"
-    elif .sku=="Git LFS storage" then "Git LFS storage"
-    elif .sku=="Packages data transfer" then "Packages transfer"
-    elif .sku=="Packages storage" then "Packages storage"
-    else "Other (" + .sku + ")"
-    end;
-  def quota:
-    if . == "Actions minutes" then 12.00
-    elif . == "Actions storage" then 0.125
-    elif . == "Git LFS bandwidth" then 0.875
-    elif . == "Git LFS storage" then 0.70
-    elif . == "Packages transfer" then 0.50
-    elif . == "Packages storage" then 0.125
-    else null
-    end;
-
-  [.usageItems[] | . + {bucket: bucket, private: ([.repositoryName] | inside($priv))}]
+jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson day "$DAY" --argjson daysInMonth "$DAYS_IN_MONTH" "
+  $JQ_COMMON
+  [.usageItems[] | . + {bucket: bucket, private: ([.repositoryName] | inside(\$priv))}]
   | group_by(.bucket)
   | map({bucket: .[0].bucket, gross_private: (map(select(.private) | .grossAmount) | add // 0)})
   | map(. + {quota: (.bucket | quota)})
   | map(select(.quota))
-  | map(. + {
-      pct_used: (.gross_private / .quota * 100),
-      projected: (.gross_private / $day * $daysInMonth),
-    })
+  | map(. + {pct_used: (.gross_private / .quota * 100), projected: (.gross_private / \$day * \$daysInMonth)})
   | map(. + {pct_projected: (.projected / .quota * 100)})
   | .[]
   | [.bucket, .gross_private, .quota, .pct_used, .projected, .pct_projected] | @tsv
-' <<<"$USAGE" | while IFS=$'\t' read -r bucket gross quota pct_used projected pct_projected; do
-  label=$(printf "%-16s \$%-6.2f / \$%-6.2f quota" "$bucket" "$gross" "$quota")
-  echo "${BOLD}${label}${RESET}"
-  printf '  used:      %s  %.1f%%\n' "$(bar "$pct_used")" "$pct_used"
-  over_note=""
-  awk -v p="$pct_projected" 'BEGIN{exit !(p>=100)}' && over_note="  ${ALERT}OVER BUDGET${RESET}"
-  printf '  projected: %s  %.1f%%%s\n\n' "$(bar "$pct_projected")" "$pct_projected" "$over_note"
+" <<<"$USAGE" | while IFS=$'\t' read -r bucket gross quota pct_used projected pct_projected; do
+  # nothing spent and nothing projected: one quiet line, skip the bar entirely
+  if awk -v u="$pct_used" -v p="$pct_projected" 'BEGIN{exit !(u<0.05 && p<0.05)}'; then
+    printf "%-16s  ${MUTED}0%% used${RESET}\n" "$bucket"
+    continue
+  fi
+  flag=""
+  awk -v p="$pct_projected" 'BEGIN{exit !(p>=100)}' && flag=" ${ALERT}!${RESET}"
+  printf '%-16s  $%-7.2f $%-7.2f %s  %5.0f%% %5.0f%%%s\n' \
+    "$bucket" "$gross" "$quota" "$(bar "$pct_used" "$pct_projected")" "$pct_used" "$pct_projected" "$flag"
 done
 
-# --- day-by-day trace: which days you're covered, which you're not --------
-# Solid block = actual day; lighter shade = projected (flat daily-average
-# extrapolation from today's rate), colored by running-total vs quota.
-echo "${TITLE}Day-by-day${RESET} ${MUTED}(day $DAY = today; ▓ = projected from today's average rate)${RESET}"
-echo
-
-jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson daysInMonth "$DAYS_IN_MONTH" '
-  def is_minutes: test("Actions Linux|Actions Windows|Actions macOS");
-  def bucket:
-    if .sku|is_minutes then "Actions minutes"
-    elif .sku=="Actions storage" then "Actions storage"
-    elif .sku=="Git LFS bandwidth" then "Git LFS bandwidth"
-    elif .sku=="Git LFS storage" then "Git LFS storage"
-    elif .sku=="Packages data transfer" then "Packages transfer"
-    elif .sku=="Packages storage" then "Packages storage"
-    else "Other (" + .sku + ")"
-    end;
-  def quota:
-    if . == "Actions minutes" then 12.00
-    elif . == "Actions storage" then 0.125
-    elif . == "Git LFS bandwidth" then 0.875
-    elif . == "Git LFS storage" then 0.70
-    elif . == "Packages transfer" then 0.50
-    elif . == "Packages storage" then 0.125
-    else null
-    end;
-
-  [.usageItems[] | . + {bucket: bucket, private: ([.repositoryName] | inside($priv)), dnum: (.date[8:10] | tonumber)}]
+# --- one-line day trace for any bucket projected at/above 60% of quota -----
+jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson daysInMonth "$DAYS_IN_MONTH" --argjson day "$DAY" "
+  $JQ_COMMON
+  [.usageItems[] | . + {bucket: bucket, private: ([.repositoryName] | inside(\$priv)), dnum: (.date[8:10] | tonumber)}]
   | map(select(.private))
   | group_by(.bucket)
   | map({
@@ -248,26 +170,19 @@ jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson daysInMonth "$DAYS_IN_MONTH
       daysum: (group_by(.dnum) | map({(.[0].dnum | tostring): (map(.grossAmount) | add)}) | add // {}),
     })
   | map(select(.quota))
-  | map(.daysum as $ds | . + {daily: [range(1; $daysInMonth + 1) | ($ds[(. | tostring)] // 0)]})
+  | map(.daysum as \$ds | . + {daily: [range(1; \$daysInMonth + 1) | (\$ds[(. | tostring)] // 0)]})
   | .[]
   | [.bucket, .quota, (.daily | @csv)] | @tsv
-' <<<"$USAGE" | while IFS=$'\t' read -r bucket quota daily_csv; do
+" <<<"$USAGE" | while IFS=$'\t' read -r bucket quota daily_csv; do
   IFS=',' read -r -a daily <<<"$daily_csv"
 
-  # cumulative through today, then flat-rate projection for the remaining days
   cum_today=0
   for ((d = 1; d <= DAY; d++)); do cum_today=$(awk -v a="$cum_today" -v b="${daily[d-1]}" 'BEGIN{print a+b}'); done
   avg=$(awk -v c="$cum_today" -v d="$DAY" 'BEGIN{print (d>0)? c/d : 0}')
-
   final_pct=$(awk -v c="$cum_today" -v a="$avg" -v n="$DAYS_IN_MONTH" -v d="$DAY" -v q="$quota" 'BEGIN{print (c + a*(n-d)) / q * 100}')
-  awk -v p="$final_pct" 'BEGIN{exit !(p<60)}' && continue   # comfortably within budget all month: skip the chart
+  awk -v p="$final_pct" 'BEGIN{exit !(p<60)}' && continue   # comfortably within budget: no trace needed
 
-  label=$(printf "%-16s quota \$%.2f" "$bucket" "$quota")
-  echo "${BOLD}${label}${RESET}"
-
-  cum="0"
-  crossover=""
-  line=""
+  cum="0"; crossover=""; line=""
   for ((d = 1; d <= DAYS_IN_MONTH; d++)); do
     if ((d <= DAY)); then
       cum=$(awk -v a="$cum" -v b="${daily[d-1]}" 'BEGIN{print a+b}')
@@ -278,23 +193,15 @@ jq -r --argjson priv "$PRIVATE_REPOS_JSON" --argjson daysInMonth "$DAYS_IN_MONTH
     fi
     pct=$(awk -v c="$cum" -v q="$quota" 'BEGIN{print c/q*100}')
     [ -z "$crossover" ] && awk -v p="$pct" 'BEGIN{exit !(p>=100)}' && crossover=$d
-    line+="$(band "$pct")${ch}${RESET}"
+    seg="$(band "$pct")${ch}${RESET}"
+    ((d == DAY)) && seg="${REV}${seg}${RESET}"
+    line+="$seg"
   done
-  echo "  $line"
 
-  # tick marks every 5 days, with an arrow under today
-  ticks=""
-  for ((d = 1; d <= DAYS_IN_MONTH; d++)); do
-    if ((d == DAY)); then ticks+="^"; elif ((d % 5 == 0)); then ticks+="|"; else ticks+=" "; fi
-  done
-  echo "  ${MUTED}${ticks}${RESET}"
-  echo "  ${MUTED}day 1$(printf "%$((DAYS_IN_MONTH - 5))s" "day $DAYS_IN_MONTH")  (^ = today, day $DAY)${RESET}"
-
+  note="${MUTED}stays under quota${RESET}"
   if [ -n "$crossover" ]; then
-    xdate=$(date -d "${YEAR}-$(printf '%02d' "$MONTH")-01 +$((crossover - 1)) days" +%Y-%m-%d)
-    echo "  ${ALERT}projected to cross the quota around day ${crossover} (${xdate})${RESET}"
-  else
-    echo "  ${MUTED}projected to stay under quota through day ${DAYS_IN_MONTH}${RESET}"
+    xdate=$(date -d "${YEAR}-$(printf '%02d' "$MONTH")-01 +$((crossover - 1)) days" +"%b %-d")
+    note="${ALERT}crosses quota ~${xdate}${RESET}"
   fi
-  echo
+  printf '%-16s  %s  %s\n' "$bucket" "$line" "$note"
 done
