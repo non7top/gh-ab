@@ -13,12 +13,12 @@ set -euo pipefail
 EXTENDED=0
 for arg in "$@"; do
   case "$arg" in
-    -x|--extended) EXTENDED=1 ;;
-    -h|--help)
-      echo "usage: gh ab [-x|--extended]"
-      echo "  (default)    compact one-line-per-bucket budget report"
-      echo "  -x/--extended  also print the per-bucket used/projected bars and the"
-      echo "                 full day-by-day quota trace with tick marks"
+    x|-x|--extended) EXTENDED=1 ;;
+    h|-h|--help)
+      echo "usage: gh ab [x]"
+      echo "  (default)  compact one-line-per-bucket budget report"
+      echo "  x          also print the per-bucket used/projected bars and the"
+      echo "             full day-by-day quota trace with tick marks"
       exit 0
       ;;
   esac
